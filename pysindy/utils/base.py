@@ -108,16 +108,7 @@ def drop_nan_rows(x, x_dot):
     return x, x_dot
 
 
-def drop_random_rows(
-    x,
-    x_dot,
-    n_subset,
-    replace,
-    feature_library,
-    pde_library_flag,
-    multiple_trajectories,
-):
-    num_trajectories = feature_library.num_trajectories
+def drop_random_rows(x, x_dot, n_subset, replace, feature_library, pde_library_flag):
     # Can't choose random n_subset points if data is from a PDE
     # (and therefore is spatially local).
     # Need to unfold it and just choose n_subset from the temporal slices
@@ -138,9 +129,9 @@ def drop_random_rows(
             spatial_grid = feature_library.spatial_grid
             dims = spatial_grid.shape[:-1]
             if len(dims) > 0:
-                num_time = n_samples // np.product(dims) // num_trajectories
+                num_time = n_samples // np.product(dims)
             else:
-                num_time = n_samples // num_trajectories
+                num_time = n_samples
 
         n_features = x.shape[1]
         if n_subset > num_time:
@@ -148,29 +139,18 @@ def drop_random_rows(
         rand_inds = np.sort(choice(range(num_time), n_subset, replace=replace))
 
         if len(dims) > 0:
-            x_shaped = np.reshape(
-                x, np.concatenate([dims, [num_time * num_trajectories], [n_features]])
-            )
+            x_shaped = np.reshape(x, np.concatenate([dims, [num_time], [n_features]]))
         else:
-            x_shaped = np.reshape(
-                x, np.concatenate([[num_time * num_trajectories], [n_features]])
-            )
+            x_shaped = np.reshape(x, np.concatenate([[num_time], [n_features]]))
         s0 = [slice(dim) for dim in x_shaped.shape]
-
-        rand_inds_total = []
-        for i in range(num_trajectories):
-            rand_inds_total.append(rand_inds + num_time * i)
-        s0[len(dims)] = rand_inds_total
+        s0[len(dims)] = rand_inds
 
         if len(dims) > 0:
             x_new = np.reshape(
-                x_shaped[tuple(s0)],
-                (np.product(dims) * n_subset * num_trajectories, x.shape[1]),
+                x_shaped[tuple(s0)], (np.product(dims) * n_subset, x.shape[1])
             )
         else:
-            x_new = np.reshape(
-                x_shaped[tuple(s0)], (n_subset * num_trajectories, x.shape[1])
-            )
+            x_new = np.reshape(x_shaped[tuple(s0)], (n_subset, x.shape[1]))
 
         if pde_library_flag == "WeakPDE":
             spatiotemporal_grid = feature_library.spatiotemporal_grid
@@ -179,25 +159,14 @@ def drop_random_rows(
             new_spatiotemporal_grid = spatiotemporal_grid[tuple(s1)]
             feature_library.spatiotemporal_grid = new_spatiotemporal_grid
             feature_library._set_up_grids()
-            s0[len(dims)] = rand_inds
-            if multiple_trajectories:
-                x_dot_new = [
-                    convert_u_dot_integral(xi[tuple(s0)], feature_library)
-                    for xi in feature_library.old_x
-                ]
-                x_dot_new = np.vstack(x_dot_new)
-            else:
-                x_dot_new = convert_u_dot_integral(
-                    feature_library.old_x[tuple(s0)], feature_library
-                )
+            x_dot_new = convert_u_dot_integral(x_shaped[tuple(s0)], feature_library)
+
         else:
             x_dot_shaped = np.reshape(
-                x_dot,
-                np.concatenate([dims, [num_time * num_trajectories], [n_features]]),
+                x_dot, np.concatenate([dims, [num_time], [n_features]])
             )
             x_dot_new = np.reshape(
-                x_dot_shaped[tuple(s0)],
-                (np.product(dims) * n_subset * num_trajectories, x.shape[1]),
+                x_dot_shaped[tuple(s0)], (np.product(dims) * n_subset, x.shape[1])
             )
     else:
         # Choose random n_subset points to use
@@ -316,8 +285,6 @@ def get_regularization(regularization):
         return lambda x, lam: lam * np.sum(x ** 2)
     elif regularization.lower() == "weighted_l2":
         return lambda x, lam: np.sum(lam @ x ** 2)
-    elif regularization.lower() == "cad":  # dummy function
-        return lambda x, lam: 0
     else:
         raise NotImplementedError("{} has not been implemented".format(regularization))
 
@@ -421,21 +388,23 @@ def convert_u_dot_integral(u, weak_pde_library):
     u_dot_integral = np.zeros((K, u.shape[-1]))
     deriv_orders = np.zeros(gdim)
     deriv_orders[-1] = 1
-    w_diff = -weak_pde_library._smooth_ppoly(deriv_orders)
+
     for j in range(u.shape[-1]):
-        u_interp = RegularGridInterpolator(
-            tuple(weak_pde_library.grid_pts), np.take(u, j, axis=-1)
-        )
         for k in range(K):
-            u_new = u_interp(np.take(weak_pde_library.XT, k, axis=0))
-            u_dot_integral_temp = trapezoid(
-                w_diff[k] * u_new,
-                x=weak_pde_library.xtgrid_k[k, :, 0],
-                axis=0,
-            )
-            for i in range(1, gdim):
-                u_dot_integral_temp = trapezoid(
-                    u_dot_integral_temp, x=weak_pde_library.xtgrid_k[k, :, i], axis=0
+            u_new = u[...,j][np.ix_(*weak_pde_library.inds_k[k])]
+            weight=weak_pde_library._poly_derivative(weak_pde_library.xt_tilde_k[k], deriv_orders) / np.prod(weak_pde_library.H_xt_k[k] ** deriv_orders)
+
+
+            func_temp = -u_new*weight
+
+            for i in range(weak_pde_library.grid_ndim):
+                s=[0]*(weak_pde_library.grid_ndim+1)
+                s[i]=slice(None,None,None)
+                s[-1]=i
+                func_temp = trapezoid(
+                    func_temp, x=weak_pde_library.XT_k[k][tuple(s)], axis=0
                 )
-            u_dot_integral[k, j] = u_dot_integral_temp
+
+            u_dot_integral[k, j] = func_temp
+
     return u_dot_integral
