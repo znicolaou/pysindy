@@ -378,6 +378,18 @@ def supports_multiple_targets(estimator):
         return False
 
 
+def integrate(f, xt, H_xt):
+    func_temp=f
+    ndim=len(H_xt)
+    for i in range(ndim):
+        s=[0]*(ndim+1)
+        s[i]=slice(None,None,None)
+        s[-1]=i
+        func_temp = 0.5*func_temp[0]*(H_xt[i]-(-xt[tuple(s)][0])) + 0.5*func_temp[-1]*(H_xt[i]-(xt[tuple(s)][-1])) + trapezoid(func_temp, x=xt[tuple(s)], axis=0)
+        # func_temp = trapezoid(func_temp, x=xt[tuple(s)], axis=0)
+    return func_temp
+
+
 def convert_u_dot_integral(u, weak_pde_library):
     """
     Takes a full set of spatiotemporal fields u(x, t) and finds the weak
@@ -392,19 +404,8 @@ def convert_u_dot_integral(u, weak_pde_library):
     for j in range(u.shape[-1]):
         for k in range(K):
             u_new = u[...,j][np.ix_(*weak_pde_library.inds_k[k])]
-            weight=weak_pde_library._poly_derivative(weak_pde_library.xt_tilde_k[k], deriv_orders) / np.prod(weak_pde_library.H_xt_k[k] ** deriv_orders)
+            weight=weak_pde_library._poly_derivative(weak_pde_library.xt_tilde_k[k], deriv_orders) / np.prod(weak_pde_library.H_xt ** deriv_orders)
 
-
-            func_temp = -u_new*weight
-
-            for i in range(weak_pde_library.grid_ndim):
-                s=[0]*(weak_pde_library.grid_ndim+1)
-                s[i]=slice(None,None,None)
-                s[-1]=i
-                func_temp = trapezoid(
-                    func_temp, x=weak_pde_library.XT_k[k][tuple(s)], axis=0
-                )
-
-            u_dot_integral[k, j] = func_temp
+            u_dot_integral[k, j] = integrate(-u_new*weight, weak_pde_library.XT_k[k]-weak_pde_library.domain_centers[k], weak_pde_library.H_xt)
 
     return u_dot_integral

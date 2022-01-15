@@ -17,6 +17,7 @@ from .base import reorder_constraints
 from .base import supports_multiple_targets
 from .base import validate_control_variables
 from .base import validate_input
+from .base import integrate
 from .odes import bacterial
 from .odes import burgers_galerkin
 from .odes import cubic_damped_SHO
