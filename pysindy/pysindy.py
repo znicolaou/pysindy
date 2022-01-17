@@ -21,7 +21,7 @@ from .feature_library import SINDyPILibrary
 from .feature_library import WeakPDELibrary
 from .optimizers import SINDyOptimizer
 from .optimizers import STLSQ
-from .utils import convert_u_dot_integral
+# from .utils import convert_u_dot_integral
 from .utils import drop_nan_rows
 from .utils import drop_random_rows
 from .utils import equations
@@ -344,10 +344,10 @@ class SINDy(BaseEstimator):
             if isinstance(self.feature_library, WeakPDELibrary):
                 if multiple_trajectories:
                     x_dot = [
-                        convert_u_dot_integral(xi, self.feature_library) for xi in x
+                        self.feature_library.convert_u_dot_integral(xi) for xi in x
                     ]
                 else:
-                    x_dot = convert_u_dot_integral(x, self.feature_library)
+                    x_dot = self.feature_library.convert_u_dot_integral(x)
             elif isinstance(self.feature_library, PDELibrary):
                 if multiple_trajectories and isinstance(t, Sequence):
                     x_dot = [
@@ -371,14 +371,14 @@ class SINDy(BaseEstimator):
                 if weak_libraries:
                     if multiple_trajectories:
                         x_dot = [
-                            convert_u_dot_integral(
-                                xi, self.feature_library.libraries_[0]
+                            self.feature_library.libraries_[0].convert_u_dot_integral(
+                                xi
                             )
                             for xi in x
                         ]
                     else:
-                        x_dot = convert_u_dot_integral(
-                            x, self.feature_library.libraries_[0]
+                        x_dot = self.feature_library.libraries_[0].convert_u_dot_integral(
+                            x
                         )
                 elif pde_libraries:
                     if multiple_trajectories and isinstance(t, Sequence):

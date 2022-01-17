@@ -1,5 +1,9 @@
 from .base import capped_simplex_projection
-from .base import convert_u_dot_integral
+# from .base import convert_u_dot_integral
+# from .base import integrate
+# from .base import integrate2
+# from .base import phi
+# from .base import linear_weights
 from .base import drop_nan_rows
 from .base import drop_random_rows
 from .base import equations
@@ -17,10 +21,6 @@ from .base import reorder_constraints
 from .base import supports_multiple_targets
 from .base import validate_control_variables
 from .base import validate_input
-from .base import integrate
-from .base import integrate2
-from .base import phi
-from .base import linear_weights
 from .odes import bacterial
 from .odes import burgers_galerkin
 from .odes import cubic_damped_SHO
