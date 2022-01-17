@@ -18,6 +18,9 @@ from .base import supports_multiple_targets
 from .base import validate_control_variables
 from .base import validate_input
 from .base import integrate
+from .base import integrate2
+from .base import phi
+from .base import linear_weights
 from .odes import bacterial
 from .odes import burgers_galerkin
 from .odes import cubic_damped_SHO

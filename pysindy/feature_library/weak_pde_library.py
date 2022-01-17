@@ -14,6 +14,10 @@ from sklearn.utils.validation import check_is_fitted
 from .base import BaseFeatureLibrary
 from pysindy.differentiation import FiniteDifference
 from pysindy.utils import integrate
+from pysindy.utils import integrate2
+from pysindy.utils import phi
+from pysindy.utils import linear_weights
+
 
 
 class WeakPDELibrary(BaseFeatureLibrary):
@@ -278,18 +282,22 @@ class WeakPDELibrary(BaseFeatureLibrary):
 
         self.XT_k = [self.spatiotemporal_grid[np.ix_(*self.inds_k[k])] for k in range(self.K)]
 
-        # new_domain_centers = np.zeros((self.K, self.grid_ndim))
-        # self.H_xt_k = np.zeros((self.K, self.grid_ndim))
-        # for k in range(self.K):
-        #     for axis in range(self.grid_ndim):
-        #         s=[0]*(self.grid_ndim+1)
-        #         s[axis]=slice(None)
-        #         s[-1]=axis
-        #         new_domain_centers[k, axis] = (self.XT_k[k][tuple(s)][-1] + self.XT_k[k][tuple(s)][0])/2
-        #         self.H_xt_k[k, axis] = (self.XT_k[k][tuple(s)][-1] - self.XT_k[k][tuple(s)][0])/2
-        # self.xt_tilde_k = [ (self.XT_k[k]-new_domain_centers[k])/H_xt_k[k] for k in range(self.K) ]
-
         self.xt_tilde_k = [ (self.XT_k[k]-self.domain_centers[k])/self.H_xt for k in range(self.K) ]
+
+        self.XT_interp_k=[]
+        for k in range(self.K):
+            self.XT_interp_k=self.XT_interp_k+[self.XT_k[k].copy()]
+            for axis in range(self.grid_ndim):
+                s=[slice(None)]*self.grid_ndim
+                s[axis]=0
+                dims=np.array(self.XT_interp_k[k].shape)
+                dims[axis]=1
+                left=np.reshape(self.XT_interp_k[k][tuple(s)].copy(),dims)
+                right=np.reshape(self.XT_interp_k[k][tuple(s)].copy(),dims)
+                left[...,axis]=self.domain_centers[k][axis]-self.H_xt[axis]
+                right[...,axis]=self.domain_centers[k][axis]+self.H_xt[axis]
+                self.XT_interp_k[k] = np.concatenate([left,self.XT_interp_k[k],right],axis=axis)
+
 
     @staticmethod
     def _combinations(n_features, n_args, interaction_only):
@@ -299,13 +307,15 @@ class WeakPDELibrary(BaseFeatureLibrary):
 
     def _poly_derivative(self, xt, d_xt):
         """Compute analytic derivatives instead of relying on finite diffs"""
+        #n.b., the hyp2f1 is a finite sum since b<0, which gives the product rule terms.
         return np.prod(
             (2 * xt) ** d_xt
             * (xt ** 2 - 1) ** (self.p - d_xt)
-            * hyp2f1((1 - d_xt) / 2.0, -d_xt / 2.0, self.p + 1 - d_xt, 1 - 1 / (1e-16+xt ** 2))
+            * hyp2f1((1 - d_xt) / 2.0, -d_xt / 2.0, self.p + 1 - d_xt, 1 - 1 / xt ** 2)
             * poch(self.p + 1 - d_xt, d_xt),
             axis=-1,
         )
+
 
     def get_feature_names(self, input_features=None):
         """Return feature names for output features.
@@ -478,6 +488,19 @@ class WeakPDELibrary(BaseFeatureLibrary):
             x = np.reshape(x_full[trajectory_ind], (n_samples_original, n_features))
             xp = np.empty((n_samples, self.n_output_features_), dtype=x.dtype)
 
+            #Interpolate the input onto the boundary of each domain
+            grids=[]
+            for axis in range(self.grid_ndim):
+                s=[0]*(self.grid_ndim+1)
+                s[axis]=slice(None)
+                s[-1]=axis
+                grids=grids+[self.spatiotemporal_grid[tuple(s)]]
+
+            dims=np.array(self.spatiotemporal_grid.shape)
+            dims[-1]=n_features
+            x_interpolator=RegularGridInterpolator(grids, np.reshape(x,dims))
+            self.x_interp_k= [ x_interpolator(self.XT_interp_k[k]) for k in range(self.K) ]
+
             # library function terms
             n_library_terms = 0
             for f in self.functions:
@@ -499,13 +522,10 @@ class WeakPDELibrary(BaseFeatureLibrary):
                     func = np.reshape(func, self.grid_dims)
 
                     for k in range(self.K):
-
-                        #test function on subdomain
-                        weight=self._poly_derivative(self.xt_tilde_k[k], np.zeros(self.grid_ndim))
-
                         #integral of product over subdomain
-                        funcs_k=funcs_k+[func[np.ix_(*self.inds_k[k])]*weight]
-                        func_final[k] = integrate(func[np.ix_(*self.inds_k[k])]*weight, self.XT_k[k]-self.domain_centers[k], self.H_xt)
+                        func = f(*[self.x_interp_k[k][..., j] for j in c])
+                        funcs_k=funcs_k+[func]
+                        func_final[k] = integrate2(func, self.XT_interp_k[k],self.domain_centers[k], self.H_xt, np.zeros(self.grid_ndim), self)
                     library_functions[:, library_idx] = func_final
                     library_idx += 1
 
@@ -521,13 +541,9 @@ class WeakPDELibrary(BaseFeatureLibrary):
                     for n in range(n_features):
 
                         for k in range(self.K):
-
-                            #test function derivatives on subdomain
-                            deriv=np.concatenate([self.multiindices[j],[0]])
-                            weight_deriv=self._poly_derivative(self.xt_tilde_k[k], deriv) / np.prod(self.H_xt ** deriv) * (-1) ** (np.sum(self.multiindices[j]) % 2)
-
                             #integral of product over subdomain
-                            func_final[k] = integrate(np.reshape(x[:,n], self.grid_dims)[np.ix_(*self.inds_k[k])]*weight_deriv, self.XT_k[k]-self.domain_centers[k], self.H_xt)
+                            deriv=np.concatenate([self.multiindices[j],[0]])
+                            func_final[k] = (-1) ** (np.sum(deriv) % 2)*integrate2(self.x_interp_k[k][...,n], self.XT_interp_k[k],self.domain_centers[k], self.H_xt, deriv, self)
 
                         library_integrals[:,library_idx] = func_final
                         library_idx += 1
@@ -556,8 +572,20 @@ class WeakPDELibrary(BaseFeatureLibrary):
 
                                     for k in range(self.K):
                                         #derivatives on subdomain
-                                        func_pure = np.reshape(x[:,n], self.grid_dims)[np.ix_(*self.inds_k[k])]
-                                        func_mixed=funcs_k[self.K*tind+k] #recycle
+                                        func_pure = self.x_interp_k[k][...,n]
+
+                                        weight=np.ones(func_pure.shape)
+                                        for axis in range(self.grid_ndim - 1):
+                                            dims=np.ones(self.grid_ndim, dtype=int)
+                                            dims[axis]=weight.shape[axis]
+                                            s=[0]*(self.grid_ndim+1)
+                                            s[axis]=slice(None,None,None)
+                                            s[-1]=axis
+                                            # test=phi(self.XT_interp_k[k][tuple(s)], 0, self.p)
+                                            # print(test.shape,weight.shape,dims)
+                                            weight=weight*np.reshape(phi(self.XT_interp_k[k][tuple(s)], 0, self.p),dims)
+
+                                        func_mixed=funcs_k[self.K*tind+k]*weight
 
                                         for axis in range(self.grid_ndim - 1):
                                             s=[0]*(self.grid_ndim+1)
@@ -566,12 +594,22 @@ class WeakPDELibrary(BaseFeatureLibrary):
                                             d_mixed = int(self.multiindices[j][axis]) // 2.0
                                             d_pure = int(self.multiindices[j][axis]) - d_mixed
                                             if d_mixed>0:
-                                                func_mixed = FiniteDifference(d=d_mixed,axis=axis,is_uniform=self.is_uniform)._differentiate(func_mixed,self.XT_k[k][tuple(s)]) * (-1) ** (d_mixed % 2)
+                                                func_mixed = FiniteDifference(d=d_mixed,axis=axis,is_uniform=self.is_uniform)._differentiate(func_mixed,self.XT_interp_k[k][tuple(s)]) * (-1) ** (d_mixed % 2)
                                             if d_pure>0:
-                                                func_pure = FiniteDifference(d=d_pure,axis=axis,is_uniform=self.is_uniform)._differentiate(func_pure,self.XT_k[k][tuple(s)])
+                                                func_pure = FiniteDifference(d=d_pure,axis=axis,is_uniform=self.is_uniform)._differentiate(func_pure,self.XT_interp_k[k][tuple(s)])
 
                                         #integral of product over subdomain
-                                        func_final[k] = integrate(func_mixed*func_pure, self.XT_k[k]-self.domain_centers[k], self.H_xt)
+                                        #We can recycle integrate2 if we add p to arguments
+                                        func_temp = func_mixed*func_pure
+                                        for i in range(self.grid_ndim):
+                                            s=[0]*(self.grid_ndim+1)
+                                            s[i]=slice(None,None,None)
+                                            s[-1]=i
+                                            weights=linear_weights((self.XT_interp_k[k][tuple(s)]-self.domain_centers[k][i])/self.H_xt[i],0,0)*self.H_xt[i]**(1)
+                                            func_temp = np.tensordot(weights,func_temp,axes=(0,0))
+
+                                        func_final[k] =func_temp
+                                        # integrate2(func_mixed*func_pure, self.XT_interp_k[k],self.domain_centers[k], self.H_xt, np.zeros(self.grid_ndim), self)
 
                                     library_mixed_integrals[:,library_idx] = func_final
                                     library_idx += 1
@@ -582,7 +620,8 @@ class WeakPDELibrary(BaseFeatureLibrary):
             if self.include_bias:
                 for k in range(self.K):
                     weight=self._poly_derivative(self.xt_tilde_k[k], np.zeros(self.grid_ndim))
-                    constants_final[k] = integrate(weight, self.XT_k[k]-self.XT_k[k]-self.domain_centers[k], self.H_xt)
+                    constants_final[k] = integrate(weight, self.XT_k[k]-self.domain_centers[k], self.H_xt)
+                    constants_final[k] = integrate(weight, self.XT_k[k]-self.domain_centers[k], self.H_xt)
                 xp[:, library_idx] = constants_final
                 library_idx += 1
 
