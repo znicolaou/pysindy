@@ -131,7 +131,8 @@ def drop_random_rows(
             s[-2] = 0
             s[-1] = slice(None, -1)
             spatial_grid = feature_library.spatiotemporal_grid[tuple(s)]
-            temporal_grid = feature_library.grid_pts[-1]
+            s[-1]=-1
+            temporal_grid = feature_library.spatiotemporal_grid[tuple(s)]
             num_time = len(temporal_grid)
             dims = spatial_grid.shape[:-1]
         else:

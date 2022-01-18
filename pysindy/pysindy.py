@@ -430,7 +430,12 @@ class SINDy(BaseEstimator):
             x = np.concatenate((x, u), axis=1)
 
         # Drop rows where derivative isn't known unless using weak PDE form
-        if not isinstance(self.feature_library, WeakPDELibrary):
+        # OR If this is a generalized library with weak libraries
+        if isinstance(self.feature_library, GeneralizedLibrary):
+            for lib in self.feature_library.libraries_:
+                if isinstance(lib, WeakPDELibrary):
+                    weak_libraries = True
+        if not isinstance(self.feature_library, WeakPDELibrary) and not weak_libraries:
             x, x_dot = drop_nan_rows(x, x_dot)
 
         if hasattr(self.optimizer, "unbias"):
