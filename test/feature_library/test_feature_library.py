@@ -693,7 +693,7 @@ def test_5D_pdes(data_5d_random_pde):
 
 
 def test_1D_weak_pdes():
-    n = 50
+    n = 10
     t = np.linspace(0, 10, n)
     x = np.linspace(0, 10, n)
     u = np.random.randn(n, n, 1)
@@ -717,7 +717,7 @@ def test_1D_weak_pdes():
 
 
 def test_2D_weak_pdes():
-    n = 50
+    n = 10
     t = np.linspace(0, 10, n)
     x = np.linspace(0, 10, n)
     y = np.linspace(0, 10, n)
@@ -742,7 +742,7 @@ def test_2D_weak_pdes():
 
 
 def test_3D_weak_pdes():
-    n = 50
+    n = 10
     t = np.linspace(0, 10, n)
     x = np.linspace(0, 10, n)
     y = np.linspace(0, 10, n)
