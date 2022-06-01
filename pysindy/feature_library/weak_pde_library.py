@@ -1,11 +1,11 @@
+import warnings
 from itertools import combinations
 from itertools import combinations_with_replacement as combinations_w_r
 from itertools import product as iproduct
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
-from scipy.special import hyp2f1
-from scipy.special import poch
+from scipy.special import binom
+from scipy.special import perm
 from sklearn import __version__
 from sklearn.utils import check_array
 from sklearn.utils.validation import check_is_fitted
@@ -13,12 +13,27 @@ from sklearn.utils.validation import check_is_fitted
 from .base import BaseFeatureLibrary
 from pysindy.differentiation import FiniteDifference
 
-# from scipy.integrate import trapezoid
-
 
 class WeakPDELibrary(BaseFeatureLibrary):
     """Generate a weak formulation library with custom functions and,
        optionally, any spatial derivatives in arbitrary dimensions.
+
+       The features in the weak formulation are integrals of derivatives of input data
+       multiplied by a test function phi, which are evaluated on K subdomains
+       randomly sampled across the spatiotemporal grid. Each subdomain
+       is initial generated with a size H_xt along each axis, and is then shrunk
+       such that the left and right boundaries lie on spatiotemporal grid points.
+       The expressions are integrated by parts to remove as many derivatives from the
+       input data as possible and put the derivatives onto the test functions.
+
+       The weak integral features are calculated assuming the function f(x) to
+       integrate against derivatives of the test function dphi(x)
+       is linear between grid points provided by the data:
+       f(x)=f_i+(x-x_i)/(x_{i+1}-x_i)*(f_{i+1}-f_i)
+       Thus f(x)*dphi(x) is approximated as a piecewise polynomial.
+       The piecewise components are integrated analytically. To improve performance,
+       the complete integral is expressed as a dot product of weights against the
+       input data f_i, which enables vectorized evaulations.
 
     Parameters
     ----------
@@ -94,6 +109,14 @@ class WeakPDELibrary(BaseFeatureLibrary):
     ensemble_indices : integer array, optional (default [0])
         The indices to use for ensembling the library.
 
+    periodic : boolean, optional (default False)
+        If True, assume the grid is periodic in all spatial directions.
+
+    num_pts_per_domain : int, deprecated (default None)
+        Included here to retain backwards compatability with older code
+        that uses this parameter. However, it merely raises a
+        DeprecationWarning and then is ignored.
+
     Attributes
     ----------
     functions : list of functions
@@ -139,12 +162,12 @@ class WeakPDELibrary(BaseFeatureLibrary):
         include_interaction=True,
         is_uniform=False,
         K=100,
-        num_pts_per_domain=100,
         H_xt=None,
         p=4,
         library_ensemble=False,
         ensemble_indices=[0],
         periodic=False,
+        num_pts_per_domain=None,
     ):
         super(WeakPDELibrary, self).__init__(
             library_ensemble=library_ensemble, ensemble_indices=ensemble_indices
@@ -157,7 +180,6 @@ class WeakPDELibrary(BaseFeatureLibrary):
         self.include_interaction = include_interaction
         self.is_uniform = is_uniform
         self.K = K
-        self.num_pts_per_domain = num_pts_per_domain
         self.H_xt = H_xt
         self.p = p
         self.periodic = periodic
@@ -177,6 +199,11 @@ class WeakPDELibrary(BaseFeatureLibrary):
             raise ValueError(
                 "Spatiotemporal grid was not passed, and at least a 1D"
                 " grid is required, corresponding to the time base."
+            )
+        if num_pts_per_domain is not None:
+            warnings.warn(
+                "The parameter num_pts_per_domain is now deprecated. This "
+                "value will be ignored by the library."
             )
 
         # list of integrals
@@ -223,7 +250,7 @@ class WeakPDELibrary(BaseFeatureLibrary):
                     "then H_xt should be a 4D list of the subdomain lengths."
                 )
             if any(self.H_xt <= np.zeros(len(self.H_xt))):
-                raise ValueError("Values in H_xt must be a positive float")
+                raise ValueError("Values in H_xt must be a positive float.")
             elif any(self.H_xt >= L_xt / 2.0):
                 raise ValueError(
                     "2 * H_xt in some dimension is larger than the "
@@ -240,7 +267,7 @@ class WeakPDELibrary(BaseFeatureLibrary):
         if self.K <= 0:
             raise ValueError("The number of subdomains must be > 0")
 
-        self._set_up_grids()
+        self._set_up_weights()
 
     def _get_spatial_endpoints(self):
         x1 = np.zeros(self.grid_ndim)
@@ -254,20 +281,26 @@ class WeakPDELibrary(BaseFeatureLibrary):
             x2[i] = self.spatiotemporal_grid[tuple(inds)][i]
         return x1, x2
 
-    def _set_up_grids(self):
+    def _set_up_weights(self):
+        """
+        Sets up weights needed for the weak library. Integrals over domain cells are
+        approximated as dot products of weights and the input data.
+        """
         dims = self.spatiotemporal_grid.shape[:-1]
         self.grid_dims = dims
 
+        # Sample the random domain centers
         xt1, xt2 = self._get_spatial_endpoints()
-        self.domain_centers = np.zeros((self.K, self.grid_ndim))
+        domain_centers = np.zeros((self.K, self.grid_ndim))
         for i in range(self.grid_ndim):
-            self.domain_centers[:, i] = np.random.uniform(
+            domain_centers[:, i] = np.random.uniform(
                 xt1[i] + self.H_xt[i], xt2[i] - self.H_xt[i], size=self.K
             )
 
+        # Indices for space-time points that lie in the domain cells
         self.inds_k = []
-        for k in range(self.K):
-            # indices corresponding to the subdomain
+        k = 0
+        while k < self.K:
             inds = []
             for i in range(self.grid_ndim):
                 s = [0] * (self.grid_ndim + 1)
@@ -276,132 +309,280 @@ class WeakPDELibrary(BaseFeatureLibrary):
                 newinds = np.intersect1d(
                     np.where(
                         self.spatiotemporal_grid[tuple(s)]
-                        >= self.domain_centers[k][i] - self.H_xt[i]
+                        >= domain_centers[k][i] - self.H_xt[i]
                     ),
                     np.where(
                         self.spatiotemporal_grid[tuple(s)]
-                        <= self.domain_centers[k][i] + self.H_xt[i]
+                        <= domain_centers[k][i] + self.H_xt[i]
                     ),
                 )
-                if len(newinds) == 0:
+                # If less than two indices along any axis, resample
+                if len(newinds) < 2:
                     for i in range(self.grid_ndim):
-                        self.domain_centers[k, i] = np.random.uniform(
+                        domain_centers[k, i] = np.random.uniform(
                             xt1[i] + self.H_xt[i], xt2[i] - self.H_xt[i], size=1
                         )
-                    k -= 1
+                    include = False
                     break
                 else:
+                    include = True
                     inds = inds + [newinds]
-            self.inds_k = self.inds_k + [inds]
+            if include:
+                self.inds_k = self.inds_k + [inds]
+                k = k + 1
 
-        self.XT_k = [
+        # Values of the spatiotemporal grid on the domain cells
+        XT_k = [
             self.spatiotemporal_grid[np.ix_(*self.inds_k[k])] for k in range(self.K)
         ]
 
-        self.XT_interp_k = []
+        # Recenter and shrink the domain cells so that grid points lie at the boundary
+        # and calculate the new size
+        H_xt_k = np.zeros((self.K, self.grid_ndim))
         for k in range(self.K):
-            self.XT_interp_k = self.XT_interp_k + [self.XT_k[k].copy()]
             for axis in range(self.grid_ndim):
-                s = [slice(None)] * self.grid_ndim
-                s[axis] = 0
-                dims = np.array(self.XT_interp_k[k].shape)
-                dims[axis] = 1
-                left = np.reshape(self.XT_interp_k[k][tuple(s)].copy(), dims)
-                right = np.reshape(self.XT_interp_k[k][tuple(s)].copy(), dims)
-                left[..., axis] = self.domain_centers[k][axis] - self.H_xt[axis]
-                right[..., axis] = self.domain_centers[k][axis] + self.H_xt[axis]
-                self.XT_interp_k[k] = np.concatenate(
-                    [left, self.XT_interp_k[k], right], axis=axis
+                s = [0] * (self.grid_ndim + 1)
+                s[axis] = slice(None)
+                s[-1] = axis
+                H_xt_k[k, axis] = (XT_k[k][tuple(s)][-1] - XT_k[k][tuple(s)][0]) / 2
+                domain_centers[k][axis] = (
+                    XT_k[k][tuple(s)][-1] + XT_k[k][tuple(s)][0]
+                ) / 2
+        # Rescaled space-time values for integration weights
+        xtilde_k = [(XT_k[k] - domain_centers[k]) / H_xt_k[k] for k in range(self.K)]
+
+        # Shapes of the grid restricted to each cell
+        shapes_k = np.array(
+            [
+                [len(self.inds_k[k][i]) for i in range(self.grid_ndim)]
+                for k in range(self.K)
+            ]
+        )
+
+        # Below we calculate the weights to convert integrals into dot products
+        # To speed up evaluations, we proceed in several steps
+
+        # Since the grid is a tensor product grid, we calculate weights along each axis
+        # Later, we multiply the weights along each axis to produce the full weights
+
+        # Within each domain cell, we calculate the interior weights
+        # and the weights at the left and right boundaries separately,
+        # since the  expression differ at the boundaries of the domains
+
+        # Extract the space-time coordinates for each domain and the indices for
+        # the left-most and right-most points for each domain.
+        # We stack the values for each domain cell into a single vector to speed up
+        grids = []  # the rescaled coordinates for each domain
+        lefts = []  # the spatiotemporal indices at the left of each domain
+        rights = []  # the spatiotemporal indices at the right of each domain
+        for i in range(self.grid_ndim):
+            s = [0] * (self.grid_ndim + 1)
+            s[-1] = i
+            s[i] = slice(None)
+            # stacked coordinates for axis i over all domains
+            grids = grids + [np.hstack([xtilde_k[k][tuple(s)] for k in range(self.K)])]
+            # stacked indices for right-most point for axis i over all domains
+            rights = rights + [np.cumsum(shapes_k[:, i]) - 1]
+            # stacked indices for left-most point for axis i over all domains
+            lefts = lefts + [np.concatenate([[0], np.cumsum(shapes_k[:, i])[:-1]])]
+
+        # Weights for the time integrals along each axis
+        tweights = []
+        deriv = np.zeros(self.grid_ndim)
+        deriv[-1] = 1
+        for i in range(self.grid_ndim):
+            # weights for interior points
+            tweights = tweights + [self._linear_weights(grids[i], deriv[i], self.p)]
+            # correct the values for the left-most points
+            tweights[i][lefts[i]] = self._left_weights(
+                grids[i][lefts[i]],
+                grids[i][lefts[i] + 1],
+                deriv[i],
+                self.p,
+            )
+            # correct the values for the right-most points
+            tweights[i][rights[i]] = self._right_weights(
+                grids[i][rights[i] - 1],
+                grids[i][rights[i]],
+                deriv[i],
+                self.p,
+            )
+
+        # Weights for pure derivative terms along each axis
+        weights0 = []
+        deriv = np.zeros(self.grid_ndim)
+        for i in range(self.grid_ndim):
+            # weights for interior points
+            weights0 = weights0 + [self._linear_weights(grids[i], deriv[i], self.p)]
+            # correct the values for the left-most points
+            weights0[i][lefts[i]] = self._left_weights(
+                grids[i][lefts[i]],
+                grids[i][lefts[i] + 1],
+                deriv[i],
+                self.p,
+            )
+            # correct the values for the right-most points
+            weights0[i][rights[i]] = self._right_weights(
+                grids[i][rights[i] - 1],
+                grids[i][rights[i]],
+                deriv[i],
+                self.p,
+            )
+
+        # Weights for the mixed library derivative terms along each axis
+        weights1 = []
+        for j in range(self.num_derivatives):
+            weights2 = []
+            deriv = np.concatenate([self.multiindices[j], [0]])
+            for i in range(self.grid_ndim):
+                # weights for interior points
+                weights2 = weights2 + [self._linear_weights(grids[i], deriv[i], self.p)]
+                # correct the values for the left-most points
+                weights2[i][lefts[i]] = self._left_weights(
+                    grids[i][lefts[i]],
+                    grids[i][lefts[i] + 1],
+                    deriv[i],
+                    self.p,
                 )
-        self.xtilde_k = [
-            (self.XT_interp_k[k] - self.domain_centers[k]) / self.H_xt
-            for k in range(self.K)
-        ]
-        self.H_xt_k = np.zeros((self.K, self.grid_ndim))
-        self.H_xt_k[:] = np.reshape(self.H_xt, (1, self.grid_ndim))
+                # correct the values for the right-most points
+                weights2[i][rights[i]] = self._right_weights(
+                    grids[i][rights[i] - 1],
+                    grids[i][rights[i]],
+                    deriv[i],
+                    self.p,
+                )
+            weights1 = weights1 + [weights2]
+
+        # Product weights over the axes for time derivatives, shaped as inds_k
+        self.fulltweights = []
+        deriv = np.zeros(self.grid_ndim)
+        deriv[-1] = 1
+        for k in range(self.K):
+
+            ret = np.ones(shapes_k[k])
+            for i in range(self.grid_ndim):
+                s = [0] * (self.grid_ndim + 1)
+                s[i] = slice(None, None, None)
+                s[-1] = i
+                dims = np.ones(self.grid_ndim, dtype=int)
+                dims[i] = shapes_k[k][i]
+                ret = ret * np.reshape(
+                    tweights[i][lefts[i][k] : rights[i][k] + 1], dims
+                )
+
+            self.fulltweights = self.fulltweights + [
+                ret * np.product(H_xt_k[k] ** (1.0 - deriv))
+            ]
+
+        # Product weights over the axes for pure derivative terms, shaped as inds_k
+        self.fullweights0 = []
+        for k in range(self.K):
+
+            ret = np.ones(shapes_k[k])
+            for i in range(self.grid_ndim):
+                s = [0] * (self.grid_ndim + 1)
+                s[i] = slice(None, None, None)
+                s[-1] = i
+                dims = np.ones(self.grid_ndim, dtype=int)
+                dims[i] = shapes_k[k][i]
+                ret = ret * np.reshape(
+                    weights0[i][lefts[i][k] : rights[i][k] + 1], dims
+                )
+
+            self.fullweights0 = self.fullweights0 + [ret * np.product(H_xt_k[k])]
+
+        # Product weights over the axes for mixed derivative terms, shaped as inds_k
+        self.fullweights1 = []
+        for k in range(self.K):
+            weights2 = []
+            for j in range(self.num_derivatives):
+                deriv = np.concatenate([self.multiindices[j], [0]])
+
+                ret = np.ones(shapes_k[k])
+                for i in range(self.grid_ndim):
+                    s = [0] * (self.grid_ndim + 1)
+                    s[i] = slice(None, None, None)
+                    s[-1] = i
+                    dims = np.ones(self.grid_ndim, dtype=int)
+                    dims[i] = shapes_k[k][i]
+                    ret = ret * np.reshape(
+                        weights1[j][i][lefts[i][k] : rights[i][k] + 1],
+                        dims,
+                    )
+
+                weights2 = weights2 + [ret * np.product(H_xt_k[k] ** (1.0 - deriv))]
+            self.fullweights1 = self.fullweights1 + [weights2]
 
     @staticmethod
     def _combinations(n_features, n_args, interaction_only):
-        """Get the combinations of features to be passed to a library function."""
+        """
+        Get the combinations of features to be passed to a library function.
+        """
         comb = combinations if interaction_only else combinations_w_r
         return comb(range(n_features), n_args)
 
-    def convert_u_dot_integral(self, u):
+    def _phi(self, x, d, p):
         """
-        Takes a full set of spatiotemporal fields u(x, t) and finds the weak
-        form of u_dot using a pre-defined weak pde library.
+        One-dimensional polynomial test function (1-x**2)**p,
+        differentiated d times, calculated term-wise in the binomial
+        expansion.
         """
-        K = self.K
-        gdim = self.grid_ndim
-        u_dot_integral = np.zeros((K, u.shape[-1]))
-        deriv_orders = np.zeros(gdim)
-        deriv_orders[-1] = 1
-
-        # Interpolate the input onto the boundary of each domain
-        grids = []
-        for axis in range(gdim):
-            s = [0] * (gdim + 1)
-            s[axis] = slice(None)
-            s[-1] = axis
-            grids = grids + [self.spatiotemporal_grid[tuple(s)]]
-
-        dims = np.array(self.spatiotemporal_grid.shape)
-        dims[-1] = u.shape[-1]
-        x_interpolator = RegularGridInterpolator(grids, np.reshape(u, dims))
-
-        for k in range(K):
-            weights = self.weights2(
-                self.xtilde_k[k], deriv_orders, self.p
-            ) * np.product(self.H_xt_k[k] ** (1.0 - deriv_orders))
-
-            for j in range(u.shape[-1]):
-                u_dot_integral[k, j] = -np.sum(
-                    weights * x_interpolator(self.XT_interp_k[k])[..., j]
-                )
-
-        return u_dot_integral
-
-    def _poly_derivative(self, xt, d_xt):
-        """Compute analytic derivatives instead of relying on finite diffs"""
-        return np.prod(
-            (2 * xt) ** d_xt
-            * (xt ** 2 - 1) ** (self.p - d_xt)
-            * hyp2f1((1 - d_xt) / 2.0, -d_xt / 2.0, self.p + 1 - d_xt, 1 - 1 / xt ** 2)
-            * poch(self.p + 1 - d_xt, d_xt),
-            axis=-1,
+        ks = np.arange(self.p + 1)
+        ks = ks[np.where(2 * (self.p - ks) - d >= 0)][:, np.newaxis]
+        return np.sum(
+            binom(self.p, ks)
+            * (-1) ** ks
+            * x[np.newaxis, :] ** (2 * (self.p - ks) - d)
+            * perm(2 * (self.p - ks), d),
+            axis=0,
         )
 
-    def phi(self, x, d, p):
-        return (
-            (2 * x) ** d
-            * (x ** 2 - 1) ** (p - d)
-            * hyp2f1((1 - d) / 2.0, -d / 2.0, p + 1 - d, 1 - 1 / x ** 2)
-            * poch(p + 1 - d, d)
+    def _phi_int(self, x, d, p):
+        """
+        Indefinite integral of one-dimensional polynomial test
+        function (1-x**2)**p, differentiated d times, calculated
+        term-wise in the binomial expansion.
+        """
+        ks = np.arange(self.p + 1)
+        ks = ks[np.where(2 * (self.p - ks) - d >= 0)][:, np.newaxis]
+        return np.sum(
+            binom(self.p, ks)
+            * (-1) ** ks
+            * x[np.newaxis, :] ** (2 * (self.p - ks) - d + 1)
+            * perm(2 * (self.p - ks), d)
+            / (2 * (self.p - ks) - d + 1),
+            axis=0,
         )
 
-    def w(self, x, d, p):
-        if d == 0:
-            return (-1) ** p * x * hyp2f1(0.5, -p, 1.5, x ** 2)
-        else:
-            return self.phi(x, d - 1, p)
+    def _xphi_int(self, x, d, p):
+        """
+        Indefinite integral of one-dimensional polynomial test function
+        x*(1-x**2)**p, differentiated d times, calculated term-wise in the
+        binomial expansion.
+        """
+        ks = np.arange(self.p + 1)
+        ks = ks[np.where(2 * (self.p - ks) - d >= 0)][:, np.newaxis]
+        return np.sum(
+            binom(self.p, ks)
+            * (-1) ** ks
+            * x[np.newaxis, :] ** (2 * (self.p - ks) - d + 2)
+            * perm(2 * (self.p - ks), d)
+            / (2 * (self.p - ks) - d + 2),
+            axis=0,
+        )
 
-    def z(self, x, d, p):
-        if d == 0:
-            return (x ** 2 - 1) ** (p + 1) / (2 * (p + 1))
-        elif d == 1:
-            return (
-                -(2.0 / 3.0)
-                * (-1) ** p
-                * p
-                * x ** 3
-                * hyp2f1(3.0 / 2.0, 1 - p, 5.0 / 2.0, x ** 2)
-            )
-        else:
-            return x * self.phi(x, d - 1, p) - self.phi(x, d - 2, p)
-
-    def linear_weights(self, x, d, p):
-        ws = self.w(x, d, p)
-        zs = self.z(x, d, p)
+    def _linear_weights(self, x, d, p):
+        """
+        One-dimensioal weights for integration against the dth derivative
+        of the polynomial test function (1-x**2)**p. This is derived
+        assuming the function to integrate is linear between grid points:
+        f(x)=f_i+(x-x_i)/(x_{i+1}-x_i)*(f_{i+1}-f_i)
+        so that f(x)*dphi(x) is a piecewise polynomial.
+        The piecewise components are computed analytically, and the integral is
+        expressed as a dot product of weights against the f_i.
+        """
+        ws = self._phi_int(x, d, p)
+        zs = self._xphi_int(x, d, p)
         return np.concatenate(
             [
                 [
@@ -419,20 +600,66 @@ class WeakPDELibrary(BaseFeatureLibrary):
             ]
         )
 
-    def weights2(self, xt, derivs, p):
-        ret = np.ones(xt.shape[:-1])
+    def _left_weights(self, x1, x2, d, p):
+        """
+        One-dimensioal weight for left-most point in integration against the dth
+        derivative of the polynomial test function (1-x**2)**p. This is derived
+        assuming the function to integrate is linear between grid points:
+        f(x)=f_i+(x-x_i)/(x_{i+1}-x_i)*(f_{i+1}-f_i)
+        so that f(x)*dphi(x) is a piecewise polynomial.
+        The piecewise components are computed analytically, and the integral is
+        expressed as a dot product of weights against the f_i.
+        """
+        w1 = self._phi_int(x1, d, p)
+        w2 = self._phi_int(x2, d, p)
+        z1 = self._xphi_int(x1, d, p)
+        z2 = self._xphi_int(x2, d, p)
+        return x2 / (x2 - x1) * (w2 - w1) - 1 / (x2 - x1) * (z2 - z1)
 
-        for i in range(self.grid_ndim):
-            s = [0] * (self.grid_ndim + 1)
-            s[i] = slice(None, None, None)
-            s[-1] = i
-            dims = np.ones(self.grid_ndim, dtype=int)
-            dims[i] = xt.shape[i]
-            ret = ret * np.reshape(
-                self.linear_weights(xt[tuple(s)], derivs[i], p), dims
+    def _right_weights(self, x1, x2, d, p):
+        """
+        One-dimensioal weight for right-most point in integration against the dth
+        derivative of the polynomial test function (1-x**2)**p. This is derived
+        assuming the function to integrate is linear between grid points:
+        f(x)=f_i+(x-x_i)/(x_{i+1}-x_i)*(f_{i+1}-f_i)
+        so that f(x)*dphi(x) is a piecewise polynomial.
+        The piecewise components are computed analytically, and the integral is
+        expressed as a dot product of weights against the f_i.
+        """
+        w1 = self._phi_int(x1, d, p)
+        w2 = self._phi_int(x2, d, p)
+        z1 = self._xphi_int(x1, d, p)
+        z2 = self._xphi_int(x2, d, p)
+        return -x1 / (x2 - x1) * (w2 - w1) + 1 / (x2 - x1) * (z2 - z1)
+
+    def convert_u_dot_integral(self, u):
+        """
+        Takes a full set of spatiotemporal fields u(x, t) and finds the weak
+        form of u_dot.
+        """
+        K = self.K
+        gdim = self.grid_ndim
+        u_dot_integral = np.zeros((K, u.shape[-1]))
+        deriv_orders = np.zeros(gdim)
+        deriv_orders[-1] = 1
+
+        # Extract the input features on indices in each domain cell
+        dims = np.array(self.spatiotemporal_grid.shape)
+        dims[-1] = u.shape[-1]
+
+        for k in range(self.K):  # loop over domain cells
+            # calculate the integral feature by taking the dot product
+            # of the weights and functions over each axis
+            u_dot_integral[k] = np.tensordot(
+                self.fulltweights[k],
+                -u[np.ix_(*self.inds_k[k])],
+                axes=(
+                    tuple(np.arange(self.grid_ndim)),
+                    tuple(np.arange(self.grid_ndim)),
+                ),
             )
 
-        return ret
+        return u_dot_integral
 
     def get_feature_names(self, input_features=None):
         """Return feature names for output features.
@@ -605,21 +832,11 @@ class WeakPDELibrary(BaseFeatureLibrary):
             x = np.reshape(x_full[trajectory_ind], (n_samples_original, n_features))
             xp = np.empty((n_samples, self.n_output_features_), dtype=x.dtype)
 
-            # Interpolate the input onto the boundary of each domain
-            grids = []
-            for axis in range(self.grid_ndim):
-                s = [0] * (self.grid_ndim + 1)
-                s[axis] = slice(None)
-                s[-1] = axis
-                grids = grids + [self.spatiotemporal_grid[tuple(s)]]
-
+            # Extract the input features on indices in each domain cell
             dims = np.array(self.spatiotemporal_grid.shape)
             dims[-1] = n_features
-            # If we remove the domain boundary interpolation,
-            # things run a little faster but are less robust
-            x_interpolator = RegularGridInterpolator(grids, np.reshape(x, dims))
-            self.x_interp_k = [
-                x_interpolator(self.XT_interp_k[k]) for k in range(self.K)
+            self.x_k = [
+                np.reshape(x, dims)[np.ix_(*self.inds_k[k])] for k in range(self.K)
             ]
 
             # library function terms
@@ -629,64 +846,62 @@ class WeakPDELibrary(BaseFeatureLibrary):
                     n_features, f.__code__.co_argcount, self.interaction_only
                 ):
                     n_library_terms += 1
-
             library_functions = np.empty((n_samples, n_library_terms), dtype=x.dtype)
-            library_idx = 0
 
-            # funcs=np.zeros(dims)
-            # func_idx=0
-            # for f in self.functions:
-            #     for c in self._combinations(
-            #         n_features, f.__code__.co_argcount, self.interaction_only
-            #     ):
-            #         funcs[...,func_idx]=f(*[x_shaped[..., l] for l in c])
-            #         func_idx += 1
+            # Evaluate the functions on the indices of domain cells
+            x_shaped = np.reshape(
+                x,
+                np.concatenate([self.spatiotemporal_grid.shape[:-1], [x.shape[-1]]]),
+            )
+            dims = np.array(x_shaped.shape)
+            dims[-1] = n_library_terms
+            funcs = np.zeros(dims)
+            func_idx = 0
+            for f in self.functions:
+                for c in self._combinations(
+                    n_features, f.__code__.co_argcount, self.interaction_only
+                ):
+                    funcs[..., func_idx] = f(*[x_shaped[..., j] for j in c])
+                    func_idx += 1
 
-            for k in range(self.K):
-                weights = self.weights2(
-                    self.xtilde_k[k], np.zeros(self.grid_ndim), self.p
-                ) * np.product(self.H_xt_k[k])
-
-                library_idx = 0
-
-                for f in self.functions:
-                    for c in self._combinations(
-                        n_features, f.__code__.co_argcount, self.interaction_only
-                    ):
-                        # integral of product over subdomain
-                        # Would it be better to calculate f(x) on all grid points
-                        # and interpolate it onto self.x_inter_k?
-                        # That's probably less accurate...
-                        func = f(*[self.x_interp_k[k][..., j] for j in c])
-
-                        library_functions[k, library_idx] = np.sum(func * weights)
-                        library_idx += 1
-
+            # library function terms
+            for k in range(self.K):  # loop over domain cells
+                # calculate the integral feature by taking the dot product
+                # of the weights and functions over each axis
+                library_functions[k] = np.tensordot(
+                    self.fullweights0[k],
+                    funcs[np.ix_(*self.inds_k[k])],
+                    axes=(
+                        tuple(np.arange(self.grid_ndim)),
+                        tuple(np.arange(self.grid_ndim)),
+                    ),
+                )
             if self.derivative_order != 0:
-                # pure integral terms, need to differentiate the weight functions
+                # pure integral terms
                 library_integrals = np.empty(
                     (n_samples, n_features * self.num_derivatives), dtype=x.dtype
                 )
-                library_idx = 0
 
-                for k in range(self.K):
+                for k in range(self.K):  # loop over domain cells
                     library_idx = 0
-                    for j in range(self.num_derivatives):
-                        deriv = np.concatenate([self.multiindices[j], [0]])
-                        weights = self.weights2(
-                            self.xtilde_k[k], deriv, self.p
-                        ) * np.product(self.H_xt_k[k] ** (1.0 - deriv))
-
-                        for n in range(n_features):
-                            # integral of product over subdomain
-                            library_integrals[k, library_idx] = (-1) ** (
-                                np.sum(deriv) % 2
-                            ) * np.sum(weights * self.x_interp_k[k][..., n])
-                            library_idx += 1
+                    for j in range(self.num_derivatives):  # loop over derivatives
+                        # Calculate the integral feature by taking the dot product
+                        # of the weights and data x_k over each axis.
+                        # Integration by parts gives power of (-1).
+                        library_integrals[k, library_idx : library_idx + n_features] = (
+                            -1
+                        ) ** (np.sum(self.multiindices[j])) * np.tensordot(
+                            self.fullweights1[k][j],
+                            self.x_k[k],
+                            axes=(
+                                tuple(np.arange(self.grid_ndim)),
+                                tuple(np.arange(self.grid_ndim)),
+                            ),
+                        )
+                        library_idx += n_features
 
                 # Mixed derivative/non-derivative terms
                 if self.include_interaction:
-                    # mixed integral terms
                     library_mixed_integrals = np.empty(
                         (
                             n_samples,
@@ -695,24 +910,12 @@ class WeakPDELibrary(BaseFeatureLibrary):
                         dtype=x.dtype,
                     )
 
-                    x_shaped = np.reshape(
-                        x,
-                        np.concatenate(
-                            [self.spatiotemporal_grid.shape[:-1], [x.shape[-1]]]
-                        ),
-                    )
+                    # Below we integrate the product of function and feature
+                    # derivatives against the derivatives of phi to calculate the weak
+                    # features. We cannot remove all derivatives of data in this case,
+                    # but we can reduce the derivative order by half.
 
-                    dims = np.array(x_shaped.shape)
-                    dims[-1] = n_library_terms
-                    funcs = np.zeros(dims)
-                    func_idx = 0
-                    for f in self.functions:
-                        for c in self._combinations(
-                            n_features, f.__code__.co_argcount, self.interaction_only
-                        ):
-                            funcs[..., func_idx] = f(*[x_shaped[..., j] for j in c])
-                            func_idx += 1
-
+                    # Calculate the necessary function and feature derivatives
                     funcs_derivs = np.zeros(
                         np.concatenate([[self.num_derivatives + 1], funcs.shape])
                     )
@@ -721,14 +924,14 @@ class WeakPDELibrary(BaseFeatureLibrary):
                     )
                     funcs_derivs[0] = funcs
                     x_derivs[0] = x_shaped
-                    self.dx_interp_k_j = []
-                    self.dfx_interp_k_j = []
+                    self.dx_k_j = []
+                    self.dfx_k_j = []
                     for j in range(self.num_derivatives):
                         for axis in range(self.grid_ndim - 1):
                             s = [0] * (self.grid_ndim + 1)
                             s[axis] = slice(None, None, None)
                             s[-1] = axis
-
+                            # Need derivatives of order less than half derivative_order
                             if self.multiindices[j][axis] > 0 and self.multiindices[j][
                                 axis
                             ] <= (self.derivative_order // 2):
@@ -750,28 +953,30 @@ class WeakPDELibrary(BaseFeatureLibrary):
                                     x_shaped, self.spatiotemporal_grid[tuple(s)]
                                 )
 
-                    dx_interpolator = RegularGridInterpolator(
-                        grids,
-                        np.transpose(x_derivs, np.roll(np.arange(x_derivs.ndim), -1)),
-                    )
-                    dfx_interpolator = RegularGridInterpolator(
-                        grids,
-                        np.transpose(
-                            funcs_derivs, np.roll(np.arange(x_derivs.ndim), -1)
-                        ),
-                    )
-                    self.dx_interp_k_j = [
-                        dx_interpolator(self.XT_interp_k[k]) for k in range(self.K)
+                    # Extract the function and feature derivatives on the domains
+                    self.dx_k_j = [
+                        [
+                            x_derivs[j][np.ix_(*self.inds_k[k])]
+                            for j in range(self.num_derivatives + 1)
+                        ]
+                        for k in range(self.K)
                     ]
-                    self.dfx_interp_k_j = [
-                        dfx_interpolator(self.XT_interp_k[k]) for k in range(self.K)
+                    self.dfx_k_j = [
+                        [
+                            funcs_derivs[j][np.ix_(*self.inds_k[k])]
+                            for j in range(self.num_derivatives + 1)
+                        ]
+                        for k in range(self.K)
                     ]
 
+                    # Calculate the mixed integrals
                     library_idx = 0
                     for j in range(self.num_derivatives):
                         integral = np.zeros((self.K, n_library_terms, n_features))
+                        # Derivative orders after integration by parts
                         derivs_mixed = self.multiindices[j] // 2
                         derivs_pure = self.multiindices[j] - derivs_mixed
+                        # Derivative orders for mixed derivatives product rule
                         derivs = np.concatenate(
                             [
                                 [np.zeros(self.grid_ndim - 1, dtype=int)],
@@ -779,35 +984,43 @@ class WeakPDELibrary(BaseFeatureLibrary):
                             ],
                             axis=0,
                         )
+                        # Sum the terms in product rule
                         for deriv in derivs[
                             np.where(np.all(derivs <= derivs_mixed, axis=1))[0]
                         ]:
                             for k in range(self.K):
-                                weights = self.weights2(
-                                    self.xtilde_k[k],
-                                    np.concatenate([deriv, [0]]),
-                                    self.p,
+                                # Weights are either in fullweights0 or fullweights1
+                                j0 = np.where(np.all(derivs == deriv, axis=1))[0][0]
+                                if j0 == 0:
+                                    weights = self.fullweights0[k]
+                                else:
+                                    weights = self.fullweights1[k][j0 - 1]
+
+                                # indices for product rule terms
+                                j1 = np.where(
+                                    np.all(derivs == derivs_mixed - deriv, axis=1)
+                                )[0][0]
+                                j2 = np.where(np.all(derivs == derivs_pure, axis=1))[0][
+                                    0
+                                ]
+                                # Calculate the integral by taking the dot product
+                                # of the weights and data x_k over each axis.
+                                # Integration by parts gives power of (-1).
+                                # Binomial factor comes by product rule.
+                                integral[k] = integral[k] + (-1) ** (
+                                    np.sum(derivs_mixed)
+                                ) * np.tensordot(
+                                    weights,
+                                    self.dfx_k_j[k][j1][..., np.newaxis]
+                                    * self.dx_k_j[k][j2][..., np.newaxis, :],
+                                    axes=(
+                                        tuple(np.arange(self.grid_ndim)),
+                                        tuple(np.arange(self.grid_ndim)),
+                                    ),
                                 ) * np.product(
-                                    self.H_xt_k[k]
-                                    ** (1.0 - np.concatenate([deriv, [0]]))
+                                    binom(derivs_mixed, deriv)
                                 )
-                                for m in range(n_library_terms):
-                                    for n in range(n_features):
-                                        j1 = np.where(
-                                            np.all(
-                                                derivs == derivs_mixed - deriv, axis=1
-                                            )
-                                        )[0][0]
-                                        j2 = np.where(
-                                            np.all(derivs == derivs_pure, axis=1)
-                                        )[0][0]
-                                        integral[k, m, n] = integral[
-                                            k, m, n
-                                        ] + np.product((-1) ** derivs_mixed) * np.sum(
-                                            weights
-                                            * self.dfx_interp_k_j[k][..., m, j1]
-                                            * self.dx_interp_k_j[k][..., n, j2]
-                                        )
+                        # collect the results
                         for n in range(n_features):
                             for m in range(n_library_terms):
                                 library_mixed_integrals[:, library_idx] = integral[
@@ -816,14 +1029,11 @@ class WeakPDELibrary(BaseFeatureLibrary):
                                 library_idx += 1
 
             library_idx = 0
-            constants_final = np.zeros(self.K)
             # Constant term
             if self.include_bias:
+                constants_final = np.zeros(self.K)
                 for k in range(self.K):
-                    weights = self.weights2(
-                        self.xtilde_k[k], np.zeros(self.grid_ndim), self.p
-                    ) * np.product(self.H_xt_k[k])
-                    constants_final[k] = np.sum(weights)
+                    constants_final[k] = np.sum(self.fullweights0[k])
                 xp[:, library_idx] = constants_final
                 library_idx += 1
 
