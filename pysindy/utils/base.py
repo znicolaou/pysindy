@@ -7,10 +7,6 @@ from scipy.optimize import bisect
 from sklearn.base import MultiOutputMixin
 from sklearn.utils.validation import check_array
 
-# from scipy.interpolate import RegularGridInterpolator
-
-# from scipy.integrate import trapezoid
-
 # Define a special object for the default value of t in
 # validate_input. Normally we would set the default
 # value of t to be None, but it is possible for the user
@@ -94,13 +90,18 @@ def _check_control_shape(x, u, trim_last_point):
         u = u[np.newaxis]
     if u.ndim == 1:
         u = u.reshape(-1, 1)
-    elif u.ndim != 2:
+        if len(x) != u.shape[0]:
+            raise ValueError(
+                "control variables u must have same number of rows as x. "
+                "u has {} rows and x has {} rows".format(u.shape[0], len(x))
+            )
+    if u.ndim != 2:
         u = u.reshape(u.size // u.shape[-1], u.shape[-1])
-    if len(x) != u.shape[0]:
-        raise ValueError(
-            "control variables u must have same number of rows as x. "
-            "u has {} rows and x has {} rows".format(u.shape[0], len(x))
-        )
+        if (x.size // x.shape[-1]) != u.shape[0]:
+            raise ValueError(
+                "control variables u must have same number of rows as x. "
+                "u has {} rows and x has {} rows".format(u.shape[0], x.shape[0])
+            )
     return u[:-1] if trim_last_point else u
 
 
@@ -120,6 +121,7 @@ def drop_random_rows(
     multiple_trajectories,
 ):
     num_trajectories = feature_library.num_trajectories
+
     # Can't choose random n_subset points if data is from a PDE
     # (and therefore is spatially local).
     # Need to unfold it and just choose n_subset from the temporal slices
@@ -131,7 +133,9 @@ def drop_random_rows(
             s[-2] = 0
             s[-1] = slice(None, -1)
             spatial_grid = feature_library.spatiotemporal_grid[tuple(s)]
-            s[-1]=-1
+            s = [0] * feature_library.spatiotemporal_grid.ndim
+            s[-2] = slice(None)
+            s[-1] = -1
             temporal_grid = feature_library.spatiotemporal_grid[tuple(s)]
             num_time = len(temporal_grid)
             dims = spatial_grid.shape[:-1]
@@ -181,7 +185,7 @@ def drop_random_rows(
             s1[-2] = rand_inds
             new_spatiotemporal_grid = spatiotemporal_grid[tuple(s1)]
             feature_library.spatiotemporal_grid = new_spatiotemporal_grid
-            feature_library._set_up_grids()
+            feature_library._set_up_weights()
             s0[len(dims)] = rand_inds
             if multiple_trajectories:
                 x_dot_new = [
@@ -316,9 +320,9 @@ def get_regularization(regularization):
     elif regularization.lower() == "weighted_l1":
         return lambda x, lam: np.sum(np.abs(lam @ x))
     elif regularization.lower() == "l2":
-        return lambda x, lam: lam * np.sum(x ** 2)
+        return lambda x, lam: lam * np.sum(x**2)
     elif regularization.lower() == "weighted_l2":
-        return lambda x, lam: np.sum(lam @ x ** 2)
+        return lambda x, lam: np.sum(lam @ x**2)
     elif regularization.lower() == "cad":  # dummy function
         return lambda x, lam: 0
     else:

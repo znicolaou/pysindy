@@ -894,7 +894,6 @@ def test_multiple_trajectories_and_ensemble(diffuse_multiple_trajectories):
         spatiotemporal_grid=XT,
         K=100,
         is_uniform=False,
-        num_pts_per_domain=30,
     )
 
     optimizer = STLSQ(threshold=0.1, alpha=1e-5, normalize_columns=False)
